@@ -62,11 +62,11 @@ Leveldb 中的**返回状态**，将错误号和错误信息封装成Status类�
 成功状态OK 是NULL state_，否则state_ 是一个包含如下信息的数组:
 
 ```
-state_[0..3] == 消息message长度 
+state_[0..3] == 消息message长度
 
 state_[4]    == 消息code
 
-state_[5..]  ==消息message 
+state_[5..]  ==消息message
 ```
 
 #### 2.3 Arena
@@ -81,9 +81,65 @@ Arena没有直接调用delete/free函数，而是由Arena的析构函数统一�
 
 应该说这是和leveldb特定的应用场景相关的，比如一个memtable使用一个Arena，当memtable被释放时，由Arena统一释放其内存。
 
+Allocate和AllocateAligned分配内存的处理除了对齐外是类似的，如果当前页空间足够，则直接分配，否则，创建新的页，并分配。
+
+```c++
+inline char* Arena::Allocate(size_t bytes) {
+  // The semantics of what to return are a bit messy if we allow
+  // 0-byte allocations, so we disallow them here (we don't need
+  // them for our internal use).
+  assert(bytes > 0);
+  if (bytes <= alloc_bytes_remaining_) {
+    char* result = alloc_ptr_;
+    alloc_ptr_ += bytes;
+    alloc_bytes_remaining_ -= bytes;
+    return result;
+  }
+  return AllocateFallback(bytes);
+}
+
+char* Arena::AllocateFallback(size_t bytes) {
+  if (bytes > kBlockSize / 4) {
+    // Object is more than a quarter of our block size.  Allocate it separately
+    // to avoid wasting too much space in leftover bytes.
+    char* result = AllocateNewBlock(bytes);
+    return result;
+  }
+
+  // We waste the remaining space in the current block.
+  alloc_ptr_ = AllocateNewBlock(kBlockSize);
+  alloc_bytes_remaining_ = kBlockSize;
+
+  char* result = alloc_ptr_;
+  alloc_ptr_ += bytes;
+  alloc_bytes_remaining_ -= bytes;
+  return result;
+}
+
+char* Arena::AllocateAligned(size_t bytes) {
+  const int align = (sizeof(void*) > 8) ? sizeof(void*) : 8;
+  static_assert((align & (align - 1)) == 0,
+                "Pointer size should be a power of 2");
+  size_t current_mod = reinterpret_cast<uintptr_t>(alloc_ptr_) & (align - 1);
+  size_t slop = (current_mod == 0 ? 0 : align - current_mod);
+  size_t needed = bytes + slop;
+  char* result;
+  if (needed <= alloc_bytes_remaining_) {
+    result = alloc_ptr_ + slop;
+    alloc_ptr_ += needed;
+    alloc_bytes_remaining_ -= needed;
+  } else {
+    // AllocateFallback always returned aligned memory
+    result = AllocateFallback(bytes);
+  }
+  assert((reinterpret_cast<uintptr_t>(result) & (align - 1)) == 0);
+  return result;
+}
+```
+
 #### 2.4 Skip list
 
-**Skip list(跳跃表）是一种可以代替平衡树的数据结构。**Skip lists应用概率保证平衡，平衡树采用严格的旋转（比如平衡二叉树有左旋右旋）来保证平衡，因此Skip list比较容易实现，而且相比平衡树有着较高的运行效率。
+**Skip list(跳跃表）是一种可以代替平衡树的数据结构。** Skip lists应用概率保证平衡，平衡树采用严格的旋转（比如平衡二叉树有左旋右旋）来保证平衡，因此Skip list比较容易实现，而且相比平衡树有着较高的运行效率。
 
 从概率上保持数据结构的平衡比显式的保持数据结构平衡要简单的多。**对于大多数应用，用skip list要比用树更自然，算法也会相对简单**。由于skip list比较简单，实现起来会比较容易，虽然和平衡树有着相同的时间复杂度(O(logn))，但是skip list的常数项相对小很多。skip list在空间上也比较节省。一个节点平均只需要1.333个指针（甚至更少），并且不需要存储保持平衡的变量。
 
@@ -92,6 +148,7 @@ Arena没有直接调用delete/free函数，而是由Arena的析构函数统一�
 ![](../imgs/leveldb3.webp)
 
 在Leveldb中，**skip list是实现memtable的核心数据结构，memtable的KV数据都存储在skip list中。**
+
 
 #### 2.5 Cache
 
@@ -108,7 +165,7 @@ Arena没有直接调用delete/free函数，而是由Arena的析构函数统一�
 定义一个LRUHandle结构体，代表cache中的元素。它包含了几个主要的成员：
 
 ```
-void* value; 
+void* value;
 ```
 
 这个存储的是cache的数据；
